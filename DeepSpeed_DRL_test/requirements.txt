@@ -1,0 +1,36 @@
+# DeepSpeed Zero3 Offload测试环境依赖
+
+# 核心深度学习框架
+torch>=1.13.0
+torchvision
+torchaudio
+
+# DeepSpeed
+deepspeed>=0.8.0
+mpi4py==4.0.3
+
+# Transformers和相关包
+transformers>=4.20.0
+tokenizers
+datasets
+accelerate
+
+# 训练相关
+numpy
+scipy
+
+# 系统监控
+psutil
+GPUtil
+
+# 工具包
+tqdm
+tensorboard
+wandb
+
+# 配置和日志
+pyyaml
+jsonschema
+
+# 可选：分布式训练支持
+# mpi4py  # 如果需要MPI后端
