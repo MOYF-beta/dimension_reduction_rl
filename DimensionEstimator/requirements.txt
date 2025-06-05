@@ -16,6 +16,8 @@ pytest>=7.0.0
 jupyter>=1.0.0
 ipywidgets>=8.0.0
 
+# For loading datasets from Hugging Face
+datasets>=2.10.0
+
 # Optional: For advanced model support
-# datasets>=2.10.0
 # tokenizers>=0.13.0

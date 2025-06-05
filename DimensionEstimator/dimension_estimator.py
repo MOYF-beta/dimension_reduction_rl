@@ -80,7 +80,7 @@ class DimensionEstimator:
         """Create mapping for dimension reduction using modulo function."""
         return {i: i % self.dimension_reduction for i in range(self.vocab_size)}
     
-    def _get_probability_distributions(self, text: str) -> np.ndarray:
+    def _get_probability_distributions(self, text: str) -> torch.Tensor:
         """
         Get probability distributions for each position in the text.
         
@@ -88,44 +88,95 @@ class DimensionEstimator:
             text: Input text
             
         Returns:
-            Array of shape (sequence_length, vocab_size) containing probability distributions
+            Tensor of shape (sequence_length, vocab_size) containing probability distributions
         """
         # Tokenize the text
         tokens = self.tokenizer.encode(text, add_special_tokens=True)
         if len(tokens) < 2:
             raise ValueError("Text too short, need at least 2 tokens")
         
-        probability_distributions = []
+        all_probs = []
         
         # Process in batches to handle memory efficiently
         with torch.no_grad():
+            batch_inputs = []
+            batch_indices = []
+            
             for i in range(1, len(tokens)):  # Start from 1 since we need context
                 # Get context (limited by max_context_length)
                 start_idx = max(0, i - self.max_context_length)
                 context_tokens = tokens[start_idx:i]
+                batch_inputs.append(context_tokens)
+                batch_indices.append(i)
                 
-                # Convert to tensor
-                input_ids = torch.tensor([context_tokens]).to(self.device)
-                
-                # Get model outputs
-                outputs = self.model(input_ids)
-                logits = outputs.logits[0, -1, :]  # Last position logits
-                
-                # Convert to probabilities
-                probs = F.softmax(logits, dim=-1).cpu().numpy()
-                
-                # Apply dimension reduction if specified
-                if self.reduction_map:
-                    reduced_probs = np.zeros(self.dimension_reduction)
-                    for orig_idx, reduced_idx in self.reduction_map.items():
-                        reduced_probs[reduced_idx] += probs[orig_idx]
-                    probs = reduced_probs
-                
-                probability_distributions.append(probs)
+                # Process batch when full or at end
+                if len(batch_inputs) >= self.batch_size or i == len(tokens) - 1:
+                    # Pad sequences to same length
+                    max_len = max(len(seq) for seq in batch_inputs)
+                    padded_inputs = []
+                    attention_masks = []
+                    
+                    for seq in batch_inputs:
+                        padded = seq + [self.tokenizer.pad_token_id] * (max_len - len(seq))
+                        mask = [1] * len(seq) + [0] * (max_len - len(seq))
+                        padded_inputs.append(padded)
+                        attention_masks.append(mask)
+                    
+                    # Convert to tensors
+                    input_ids = torch.tensor(padded_inputs).to(self.device)
+                    attention_mask = torch.tensor(attention_masks).to(self.device)
+                    
+                    # Get model outputs
+                    outputs = self.model(input_ids=input_ids, attention_mask=attention_mask)
+                    
+                    # Get last non-padded position for each sequence
+                    for batch_idx, seq_len in enumerate([len(seq) for seq in batch_inputs]):
+                        logits = outputs.logits[batch_idx, seq_len - 1, :]  # Last real token
+                        probs = F.softmax(logits, dim=-1)
+                        
+                        # Apply dimension reduction if specified
+                        if self.reduction_map:
+                            reduced_probs = torch.zeros(self.dimension_reduction, device=self.device)
+                            for orig_idx, reduced_idx in self.reduction_map.items():
+                                reduced_probs[reduced_idx] += probs[orig_idx]
+                            probs = reduced_probs
+                        
+                        all_probs.append(probs)
+                    
+                    # Reset batch
+                    batch_inputs = []
+                    batch_indices = []
         
-        return np.array(probability_distributions)
+        return torch.stack(all_probs)
     
-    def _fisher_rao_distance(self, p1: np.ndarray, p2: np.ndarray) -> float:
+    def _fisher_rao_distance_batch(self, p1: torch.Tensor, p2: torch.Tensor) -> torch.Tensor:
+        """
+        Calculate Fisher-Rao distance between batches of probability distributions.
+        
+        Args:
+            p1: Tensor of shape (..., vocab_size)
+            p2: Tensor of shape (..., vocab_size)
+            
+        Returns:
+            Tensor of Fisher-Rao distances
+        """
+        # Ensure probabilities are positive (add small epsilon for numerical stability)
+        eps = 1e-12
+        p1 = torch.clamp(p1, min=eps)
+        p2 = torch.clamp(p2, min=eps)
+        
+        # Calculate Bhattacharyya coefficient
+        bc = torch.sum(torch.sqrt(p1 * p2), dim=-1)
+        
+        # Clamp to [0, 1] to avoid numerical issues with arccos
+        bc = torch.clamp(bc, min=0.0, max=1.0)
+        
+        # Fisher-Rao distance
+        distance = 2 * torch.arccos(bc)
+        
+        return distance
+
+    def _fisher_rao_distance(self, p1: torch.Tensor, p2: torch.Tensor) -> float:
         """
         Calculate Fisher-Rao distance between two probability distributions.
         
@@ -133,73 +184,166 @@ class DimensionEstimator:
         """
         # Ensure probabilities are positive (add small epsilon for numerical stability)
         eps = 1e-12
-        p1 = np.maximum(p1, eps)
-        p2 = np.maximum(p2, eps)
+        p1 = torch.clamp(p1, min=eps)
+        p2 = torch.clamp(p2, min=eps)
         
         # Calculate Bhattacharyya coefficient
-        bc = np.sum(np.sqrt(p1 * p2))
+        bc = torch.sum(torch.sqrt(p1 * p2))
         
         # Clamp to [0, 1] to avoid numerical issues with arccos
-        bc = np.clip(bc, 0.0, 1.0)
+        bc = torch.clamp(bc, min=0.0, max=1.0)
         
         # Fisher-Rao distance
-        distance = 2 * np.arccos(bc)
+        distance = 2 * torch.arccos(bc)
         
-        return distance
+        return distance.item()
     
-    def _filter_high_entropy(self, prob_distributions: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    def _filter_high_entropy(self, prob_distributions: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Filter probability distributions to keep only high-entropy ones.
         
         Args:
-            prob_distributions: Array of probability distributions
+            prob_distributions: Tensor of probability distributions
             
         Returns:
             Tuple of (filtered_distributions, indices)
         """
-        max_probs = np.max(prob_distributions, axis=1)
+        max_probs = torch.max(prob_distributions, dim=1)[0]
         high_entropy_mask = max_probs < self.eta_threshold
         
         filtered_distributions = prob_distributions[high_entropy_mask]
-        indices = np.where(high_entropy_mask)[0]
+        indices = torch.where(high_entropy_mask)[0]
         
         return filtered_distributions, indices
     
-    def _compute_correlation_integral(self, prob_distributions: np.ndarray, epsilon: float) -> float:
+    def _compute_correlation_integral_batch(self, prob_distributions: torch.Tensor, epsilons: torch.Tensor) -> torch.Tensor:
         """
-        Compute the correlation integral C(ε) for a given epsilon.
+        Compute correlation integrals for multiple epsilon values using vectorized operations.
         
         Args:
-            prob_distributions: Array of probability distributions
-            epsilon: Distance threshold
+            prob_distributions: Tensor of probability distributions [N, vocab_size]
+            epsilons: Tensor of epsilon values [num_epsilons]
             
         Returns:
-            Correlation integral value
+            Tensor of correlation integral values [num_epsilons]
         """
-        N = len(prob_distributions)
+        N = prob_distributions.shape[0]
         if N < 2:
-            return 0.0
+            return torch.zeros_like(epsilons)
         
-        count = 0
+        # Estimate memory usage and decide on processing strategy
+        vocab_size = prob_distributions.shape[1]
+        memory_required = N * N * vocab_size * 4  # More accurate memory estimate
+        
+        if torch.cuda.is_available():
+            available_memory = torch.cuda.get_device_properties(self.device).total_memory * 0.8  # Use 80% of available memory
+        else:
+            available_memory = 4e9  # 4GB for CPU
+        
+        # Use conservative thresholds
+        if memory_required < available_memory * 0.1 and N < 200:
+            # Use full batch processing only for very small datasets
+            return self._compute_correlation_integral_batch_full(prob_distributions, epsilons)
+        else:
+            # Use chunked processing for larger datasets
+            # Calculate conservative chunk size based on available memory
+            max_pairs_per_chunk = int(available_memory * 0.05 / (vocab_size * 4))  # Very conservative
+            chunk_size = max(50, int(np.sqrt(max_pairs_per_chunk)))
+            chunk_size = min(chunk_size, 200)  # Cap at 200 for safety
+            print(f"Using chunked processing with chunk size: {chunk_size}")
+            return self._compute_correlation_integral_chunked(prob_distributions, epsilons, chunk_size)
+
+    def _compute_correlation_integral_batch_full(self, prob_distributions: torch.Tensor, epsilons: torch.Tensor) -> torch.Tensor:
+        """
+        Full batch computation for smaller datasets.
+        """
+        N = prob_distributions.shape[0]
+        
+        # Calculate all pairwise distances using broadcasting
+        prob_expanded_i = prob_distributions.unsqueeze(1)  # [N, 1, vocab_size]
+        prob_expanded_j = prob_distributions.unsqueeze(0)  # [1, N, vocab_size]
+        
+        # Calculate Fisher-Rao distances for all pairs
+        distances = self._fisher_rao_distance_batch(prob_expanded_i, prob_expanded_j)  # [N, N]
+        
+        # Only consider upper triangular part (i < j)
+        triu_mask = torch.triu(torch.ones(N, N, device=self.device), diagonal=1).bool()
+        valid_distances = distances[triu_mask]  # [N*(N-1)/2]
+        
+        # For each epsilon, count distances less than epsilon
+        correlation_integrals = []
+        for eps in epsilons:
+            count = torch.sum(valid_distances < eps).float()
+            total_pairs = valid_distances.shape[0]
+            correlation_integrals.append(count / total_pairs if total_pairs > 0 else 0.0)
+        
+        return torch.tensor(correlation_integrals, device=self.device)
+
+    def _compute_correlation_integral_chunked(self, prob_distributions: torch.Tensor, epsilons: torch.Tensor, chunk_size: int = 1000) -> torch.Tensor:
+        """
+        Memory-efficient computation of correlation integrals using chunked processing.
+        
+        Args:
+            prob_distributions: Tensor of probability distributions [N, vocab_size]
+            epsilons: Tensor of epsilon values [num_epsilons]
+            chunk_size: Size of chunks for processing
+            
+        Returns:
+            Tensor of correlation integral values [num_epsilons]
+        """
+        N = prob_distributions.shape[0]
+        if N < 2:
+            return torch.zeros_like(epsilons)
+        
+        # Initialize counters for each epsilon
+        total_counts = torch.zeros(len(epsilons), device=self.device)
         total_pairs = 0
         
-        # Calculate pairwise distances
-        for i in range(N):
-            for j in range(i + 1, N):
-                distance = self._fisher_rao_distance(prob_distributions[i], prob_distributions[j])
-                total_pairs += 1
-                if distance < epsilon:
-                    count += 1
+        # Process in chunks to manage memory
+        for i in range(0, N, chunk_size):
+            end_i = min(i + chunk_size, N)
+            chunk_i = prob_distributions[i:end_i]
+            
+            for j in range(i, N, chunk_size):
+                end_j = min(j + chunk_size, N)
+                chunk_j = prob_distributions[j:end_j]
+                
+                # Calculate distances for this chunk pair
+                chunk_i_expanded = chunk_i.unsqueeze(1)  # [chunk_i_size, 1, vocab_size]
+                chunk_j_expanded = chunk_j.unsqueeze(0)  # [1, chunk_j_size, vocab_size]
+                
+                distances = self._fisher_rao_distance_batch(chunk_i_expanded, chunk_j_expanded)
+                
+                # Only count upper triangular pairs
+                if i == j:
+                    # Same chunk - use upper triangular mask
+                    chunk_size_i, chunk_size_j = distances.shape
+                    triu_mask = torch.triu(torch.ones(chunk_size_i, chunk_size_j, device=self.device), diagonal=1).bool()
+                    valid_distances = distances[triu_mask]
+                elif i < j:
+                    # Different chunks where i < j - use all pairs
+                    valid_distances = distances.flatten()
+                else:
+                    # Skip when i > j to avoid double counting
+                    continue
+                
+                # Count pairs for each epsilon
+                for eps_idx, eps in enumerate(epsilons):
+                    total_counts[eps_idx] += torch.sum(valid_distances < eps)
+                
+                total_pairs += valid_distances.numel()
         
-        # Return correlation integral (normalized by total pairs)
-        return count / total_pairs if total_pairs > 0 else 0.0
-    
+        # Calculate correlation integrals
+        correlation_integrals = total_counts.float() / total_pairs if total_pairs > 0 else torch.zeros_like(total_counts)
+        
+        return correlation_integrals
+
     def _estimate_correlation_dimension(
         self, 
-        prob_distributions: np.ndarray,
+        prob_distributions: torch.Tensor,
         epsilon_range: Optional[Tuple[float, float]] = None,
         num_epsilons: int = 20
-    ) -> Tuple[float, float, np.ndarray, np.ndarray]:
+    ) -> Tuple[float, float, torch.Tensor, torch.Tensor]:
         """
         Estimate correlation dimension using linear regression on log-log plot.
         
@@ -213,44 +357,47 @@ class DimensionEstimator:
         """
         if epsilon_range is None:
             # Estimate reasonable epsilon range based on typical distances
-            distances = []
-            N = min(len(prob_distributions), 100)  # Sample for efficiency
-            for i in range(N):
-                for j in range(i + 1, min(i + 10, N)):
-                    dist = self._fisher_rao_distance(prob_distributions[i], prob_distributions[j])
-                    distances.append(dist)
-            
-            if distances:
-                min_dist = np.min(distances)
-                max_dist = np.max(distances)
-                epsilon_range = (min_dist * 0.1, max_dist * 0.9)
-            else:
-                epsilon_range = (0.01, 1.0)
+            N = min(prob_distributions.shape[0], 100)  # Sample for efficiency
+            with torch.no_grad():
+                sample_dists = prob_distributions[:N]
+                # Calculate sample distances
+                prob_expanded_i = sample_dists.unsqueeze(1)  # [N, 1, vocab_size]
+                prob_expanded_j = sample_dists.unsqueeze(0)  # [1, N, vocab_size]
+                distances = self._fisher_rao_distance_batch(prob_expanded_i, prob_expanded_j)
+                
+                # Get upper triangular distances
+                triu_mask = torch.triu(torch.ones(N, N, device=self.device), diagonal=1).bool()
+                valid_distances = distances[triu_mask]
+                
+                if len(valid_distances) > 0:
+                    min_dist = torch.min(valid_distances).item()
+                    max_dist = torch.max(valid_distances).item()
+                    epsilon_range = (min_dist * 0.1, max_dist * 0.9)
+                else:
+                    epsilon_range = (0.01, 1.0)
         
         # Generate epsilon values (log-spaced)
-        epsilons = np.logspace(
-            np.log10(epsilon_range[0]), 
-            np.log10(epsilon_range[1]), 
-            num_epsilons
+        epsilons = torch.logspace(
+            math.log10(epsilon_range[0]), 
+            math.log10(epsilon_range[1]), 
+            num_epsilons,
+            device=self.device
         )
         
-        correlation_integrals = []
+        print("Computing correlation integrals with batch processing...")
         
-        print("Computing correlation integrals...")
-        for epsilon in tqdm(epsilons):
-            c_eps = self._compute_correlation_integral(prob_distributions, epsilon)
-            correlation_integrals.append(c_eps)
-        
-        correlation_integrals = np.array(correlation_integrals)
+        # Use batch processing for correlation integrals
+        correlation_integrals = self._compute_correlation_integral_batch(prob_distributions, epsilons)
         
         # Filter out zero values for log-log regression
         nonzero_mask = correlation_integrals > 0
-        if np.sum(nonzero_mask) < 3:
+        if torch.sum(nonzero_mask) < 3:
             warnings.warn("Too few non-zero correlation integral values for reliable dimension estimation")
-            return 0.0, 0.0, epsilons, correlation_integrals
+            return 0.0, 0.0, epsilons.cpu(), correlation_integrals.cpu()
         
-        log_epsilons = np.log10(epsilons[nonzero_mask])
-        log_correlations = np.log10(correlation_integrals[nonzero_mask])
+        # Convert to numpy for linear regression (scipy only supports numpy)
+        log_epsilons = torch.log10(epsilons[nonzero_mask]).cpu().numpy()
+        log_correlations = torch.log10(correlation_integrals[nonzero_mask]).cpu().numpy()
         
         # Linear regression to find slope (correlation dimension)
         slope, intercept, r_value, p_value, std_err = linregress(log_epsilons, log_correlations)
@@ -258,7 +405,7 @@ class DimensionEstimator:
         correlation_dimension = slope
         r_squared = r_value ** 2
         
-        return correlation_dimension, r_squared, epsilons, correlation_integrals
+        return correlation_dimension, r_squared, epsilons.cpu(), correlation_integrals.cpu()
     
     def estimate_dimension(self, texts: List[str]) -> Dict[str, float]:
         """
@@ -281,7 +428,7 @@ class DimensionEstimator:
             try:
                 prob_dists = self._get_probability_distributions(text)
                 all_prob_distributions.append(prob_dists)
-                text_lengths.append(len(prob_dists))
+                text_lengths.append(prob_dists.shape[0])
             except Exception as e:
                 print(f"Warning: Failed to process text {i+1}: {e}")
                 continue
@@ -290,16 +437,16 @@ class DimensionEstimator:
             raise ValueError("No texts could be processed successfully")
         
         # Concatenate all probability distributions
-        combined_prob_distributions = np.vstack(all_prob_distributions)
+        combined_prob_distributions = torch.cat(all_prob_distributions, dim=0)
         
-        print(f"Total sequence length: {len(combined_prob_distributions)}")
+        print(f"Total sequence length: {combined_prob_distributions.shape[0]}")
         
         # Filter for high-entropy distributions
         filtered_dists, filtered_indices = self._filter_high_entropy(combined_prob_distributions)
         
-        print(f"High-entropy sequences: {len(filtered_dists)} (η < {self.eta_threshold})")
+        print(f"High-entropy sequences: {filtered_dists.shape[0]} (η < {self.eta_threshold})")
         
-        if len(filtered_dists) < 10:
+        if filtered_dists.shape[0] < 10:
             warnings.warn("Very few high-entropy sequences found. Results may be unreliable.")
         
         # Estimate correlation dimension
@@ -309,13 +456,13 @@ class DimensionEstimator:
         results = {
             'correlation_dimension': correlation_dim,
             'r_squared': r_squared,
-            'total_sequences': len(combined_prob_distributions),
-            'high_entropy_sequences': len(filtered_dists),
-            'high_entropy_fraction': len(filtered_dists) / len(combined_prob_distributions),
+            'total_sequences': combined_prob_distributions.shape[0],
+            'high_entropy_sequences': filtered_dists.shape[0],
+            'high_entropy_fraction': filtered_dists.shape[0] / combined_prob_distributions.shape[0],
             'text_lengths': text_lengths,
             'eta_threshold': self.eta_threshold,
-            'epsilons': epsilons,
-            'correlation_integrals': correlations
+            'epsilons': epsilons.numpy() if isinstance(epsilons, torch.Tensor) else epsilons,
+            'correlation_integrals': correlations.numpy() if isinstance(correlations, torch.Tensor) else correlations
         }
         
         print(f"Estimated correlation dimension: {correlation_dim:.3f}")
