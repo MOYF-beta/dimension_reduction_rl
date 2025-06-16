@@ -82,7 +82,7 @@ class DimensionEstimator:
     
     def _get_probability_distributions(self, text: str) -> torch.Tensor:
         """
-        Get probability distributions for each position in the text.
+        Get probability distributions for each position in the text using KV cache optimization.
         
         Args:
             text: Input text
@@ -97,44 +97,48 @@ class DimensionEstimator:
         
         all_probs = []
         
-        # Process in batches to handle memory efficiently
+        # Use KV cache for efficient sequential processing
         with torch.no_grad():
-            batch_inputs = []
-            batch_indices = []
+            past_key_values = None
+            input_ids = torch.tensor([tokens[0]], device=self.device).unsqueeze(0)  # Start with first token
             
-            for i in range(1, len(tokens)):  # Start from 1 since we need context
-                # Get context (limited by max_context_length)
-                start_idx = max(0, i - self.max_context_length)
-                context_tokens = tokens[start_idx:i]
-                batch_inputs.append(context_tokens)
-                batch_indices.append(i)
-                
-                # Process batch when full or at end
-                if len(batch_inputs) >= self.batch_size or i == len(tokens) - 1:
-                    # Pad sequences to same length
-                    max_len = max(len(seq) for seq in batch_inputs)
-                    padded_inputs = []
-                    attention_masks = []
-                    
-                    for seq in batch_inputs:
-                        padded = seq + [self.tokenizer.pad_token_id] * (max_len - len(seq))
-                        mask = [1] * len(seq) + [0] * (max_len - len(seq))
-                        padded_inputs.append(padded)
-                        attention_masks.append(mask)
-                    
-                    # Convert to tensors
-                    input_ids = torch.tensor(padded_inputs).to(self.device)
-                    attention_mask = torch.tensor(attention_masks).to(self.device)
-                    
-                    # Get model outputs
-                    outputs = self.model(input_ids=input_ids, attention_mask=attention_mask)
-                    
-                    # Get last non-padded position for each sequence
-                    for batch_idx, seq_len in enumerate([len(seq) for seq in batch_inputs]):
-                        logits = outputs.logits[batch_idx, seq_len - 1, :]  # Last real token
+            # Process tokens sequentially with KV cache
+            for i in range(1, len(tokens)):
+                # For the first iteration, we need to process the initial context
+                if i == 1:
+                    # Process initial context if longer than 1 token
+                    if len(tokens) > 2:
+                        initial_context_end = min(len(tokens), self.max_context_length)
+                        input_ids = torch.tensor([tokens[:initial_context_end]], device=self.device)
+                        outputs = self.model(input_ids=input_ids, use_cache=True)
+                        past_key_values = outputs.past_key_values
+                        
+                        # Extract probabilities for each position from 1 to initial_context_end-1
+                        for pos in range(1, initial_context_end):
+                            logits = outputs.logits[0, pos - 1, :]  # pos-1 because logits are shifted
+                            probs = F.softmax(logits, dim=-1)
+                            
+                            # Apply dimension reduction if specified
+                            if self.reduction_map:
+                                reduced_probs = torch.zeros(self.dimension_reduction, device=self.device)
+                                for orig_idx, reduced_idx in self.reduction_map.items():
+                                    reduced_probs[reduced_idx] += probs[orig_idx]
+                                probs = reduced_probs
+                            
+                            all_probs.append(probs)
+                        
+                        # Update position to continue from where we left off
+                        i = initial_context_end
+                        if i >= len(tokens):
+                            break
+                    else:
+                        # Simple case: just 2 tokens
+                        outputs = self.model(input_ids=input_ids, use_cache=True)
+                        past_key_values = outputs.past_key_values
+                        
+                        logits = outputs.logits[0, -1, :]
                         probs = F.softmax(logits, dim=-1)
                         
-                        # Apply dimension reduction if specified
                         if self.reduction_map:
                             reduced_probs = torch.zeros(self.dimension_reduction, device=self.device)
                             for orig_idx, reduced_idx in self.reduction_map.items():
@@ -142,10 +146,43 @@ class DimensionEstimator:
                             probs = reduced_probs
                         
                         all_probs.append(probs)
+                        continue
+                
+                # For subsequent tokens, use cached key-values and only process the new token
+                if past_key_values is not None:
+                    # Check if we need to truncate cache due to max_context_length
+                    if past_key_values[0][0].shape[2] >= self.max_context_length:
+                        # Truncate the oldest entries from cache
+                        truncate_length = past_key_values[0][0].shape[2] - self.max_context_length + 1
+                        new_past_key_values = []
+                        for layer_past in past_key_values:
+                            new_layer_past = []
+                            for kv in layer_past:
+                                new_layer_past.append(kv[:, :, truncate_length:, :])
+                            new_past_key_values.append(tuple(new_layer_past))
+                        past_key_values = tuple(new_past_key_values)
                     
-                    # Reset batch
-                    batch_inputs = []
-                    batch_indices = []
+                    # Process only the current token
+                    current_token = torch.tensor([[tokens[i]]], device=self.device)
+                    outputs = self.model(
+                        input_ids=current_token,
+                        past_key_values=past_key_values,
+                        use_cache=True
+                    )
+                    past_key_values = outputs.past_key_values
+                    
+                    # Get probability distribution for the current position
+                    logits = outputs.logits[0, -1, :]
+                    probs = F.softmax(logits, dim=-1)
+                    
+                    # Apply dimension reduction if specified
+                    if self.reduction_map:
+                        reduced_probs = torch.zeros(self.dimension_reduction, device=self.device)
+                        for orig_idx, reduced_idx in self.reduction_map.items():
+                            reduced_probs[reduced_idx] += probs[orig_idx]
+                        probs = reduced_probs
+                    
+                    all_probs.append(probs)
         
         return torch.stack(all_probs)
     
